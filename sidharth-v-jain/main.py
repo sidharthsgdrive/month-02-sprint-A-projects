@@ -9,19 +9,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 
-# Send application logs to Railway's container logs.
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("emoji-search")
 
-logger.info("Importing application and loading embedding model")
-model_load_start = time.time()
+logger.info("Loading sentence-transformer model")
+model_start = time.time()
 model = SentenceTransformer("all-MiniLM-L6-v2")
-logger.info("Embedding model loaded in %.1f seconds", time.time() - model_load_start)
+logger.info("Model loaded in %.1f seconds", time.time() - model_start)
 
-logger.info("Creating ChromaDB client and emoji collection")
+logger.info("Creating ChromaDB collection")
 client = chromadb.Client()
 collection = client.create_collection(
     name="emojis",
@@ -33,36 +32,29 @@ def build_index():
     start = time.time()
     logger.info("Starting emoji index build")
 
-    names, chars = [], []
+    names = []
+    chars = []
     for char, data in emoji.EMOJI_DATA.items():
         if data.get("status") != emoji.STATUS["fully_qualified"]:
             continue
         names.append(data["en"].strip(":").replace("_", " "))
         chars.append(char)
 
-    logger.info(
-        "Collected %d fully-qualified emojis in %.1f seconds",
-        len(names),
-        time.time() - start,
-    )
+    logger.info("Collected %d emojis in %.1f seconds", len(names), time.time() - start)
 
     if not names:
-        logger.warning("No emojis found; skipping index creation")
+        logger.warning("No emojis found; skipping index build")
         return
 
-    logger.info("Generating embeddings (batch_size=32)")
+    logger.info("Generating embeddings with batch_size=32")
     embeddings = model.encode(
         names,
         show_progress_bar=False,
         batch_size=32,
     ).tolist()
-    logger.info(
-        "Generated embeddings for %d emojis in %.1f seconds",
-        len(names),
-        time.time() - start,
-    )
+    logger.info("Embeddings generated in %.1f seconds", time.time() - start)
 
-    logger.info("Adding emoji documents and embeddings to ChromaDB")
+    logger.info("Adding records to ChromaDB")
     collection.add(
         ids=[str(i) for i in range(len(names))],
         documents=names,
@@ -70,7 +62,7 @@ def build_index():
         metadatas=[{"emoji": char} for char in chars],
     )
     logger.info(
-        "Emoji index build completed: %d records in %.1f seconds",
+        "Index build complete: %d records in %.1f seconds",
         collection.count(),
         time.time() - start,
     )
@@ -78,16 +70,16 @@ def build_index():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("FastAPI lifespan startup: beginning index build")
+    logger.info("Startup: beginning index build")
     try:
         build_index()
-        logger.info("FastAPI lifespan startup: index build complete")
+        logger.info("Startup: index build finished")
         yield
     except Exception:
-        logger.exception("Application startup or request lifespan failed")
+        logger.exception("Application lifespan failed")
         raise
     finally:
-        logger.info("FastAPI lifespan shutdown")
+        logger.info("Application shutting down")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -107,12 +99,20 @@ def root():
 
 @app.get("/search")
 def search(q: str, top_k: int = 10):
-    logger.info("Search request received: q=%r top_k=%d", q, top_k)
+    logger.info("Search request: q=%r top_k=%d", q, top_k)
+
     try:
         query_embedding = model.encode(q).tolist()
+        count = collection.count()
+
+        if count == 0:
+            logger.warning("Search requested but emoji index is empty")
+            return []
+
+        safe_top_k = min(max(top_k, 1), count)
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(max(top_k, 1), max(collection.count(), 1)),
+            n_results=safe_top_k,
         )
 
         response = [
@@ -126,4 +126,11 @@ def search(q: str, top_k: int = 10):
                 results["documents"][0],
                 results["distances"][0],
             )
+        ]
 
+        logger.info("Search completed: returned %d results", len(response))
+        return response
+
+    except Exception:
+        logger.exception("Search request failed")
+        raise
